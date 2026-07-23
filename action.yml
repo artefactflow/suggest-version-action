@@ -7,20 +7,25 @@ branding:
   icon: 'tag'
   color: 'blue'
 
+# Every input can also be supplied as an ARTEFACTFLOW_-prefixed environment variable, so one job-level `env:` block can configure every step. A `with:` value always wins over the variable.
+#
+# `api-url` and `bump` deliberately declare no `default:`. The runner substitutes a declared default before the action runs, which would make the input non-empty and the environment variable unreachable; their defaults are applied by the action itself.
 inputs:
   api-url:
-    description: 'Base URL of the ArtefactFlow API, for example https://api.artefactflow.example. Supplied by the operator; never hard-coded.'
+    description: 'Base URL of the ArtefactFlow API. Defaults to https://api.artefactflow.app; self-hosted operators override it. Environment variable: ARTEFACTFLOW_API_URL.'
+    required: false
+  client-id:
+    description: "A service account's client id — its 24-character hex id. Environment variable: ARTEFACTFLOW_CLIENT_ID."
     required: true
-  token:
-    description: 'Bearer token with the artefact:read scope. Pass it from a secret — never inline it in the workflow file.'
+  client-secret:
+    description: "The service account's client secret. Pass it from a secret — never inline it in the workflow file. Environment variable: ARTEFACTFLOW_CLIENT_SECRET."
     required: true
-  artefact-id:
-    description: "The artefact's 24-character hex id. Artefacts are addressed by id, not by name."
+  artefact-name:
+    description: 'The artefact name. Exact and case-sensitive, and unique within your organisation. Environment variable: ARTEFACTFLOW_ARTEFACT_NAME.'
     required: true
   bump:
-    description: 'Which suggestion becomes the `version` output: suggested (default), major, minor, patch, alpha, beta, or rc. All variants are always available as their own outputs.'
+    description: 'Which suggestion becomes the `version` output: suggested (default), major, minor, patch, alpha, beta, or rc. All variants are always available as their own outputs. Environment variable: ARTEFACTFLOW_BUMP.'
     required: false
-    default: 'suggested'
 
 outputs:
   version:
@@ -42,6 +47,9 @@ outputs:
 
 runs:
   using: 'docker'
-  # Built from source on the runner. Once the release workflow has published an image, switch this to the pre-built image so each run pulls instead of builds:
-  #   image: 'docker://ghcr.io/artefactflow/suggest-version-action:v1'
+  # Built from source on the runner until the first release publishes an image. From then on this references one exact, immutable image version, which is bumped as part of cutting a release:
+  #
+  #   image: 'docker://ghcr.io/artefactflow/suggest-version-action:1.2.3'
+  #
+  # Exact, not a floating `:1`. A consumer who pins `uses: ...@v1.2.0` or a commit SHA expects to keep running that code; a floating tag would silently hand them a newer image and make pinning meaningless. The release workflow refuses to publish if this reference and the release tag disagree.
   image: 'Dockerfile'

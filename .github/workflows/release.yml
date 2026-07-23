@@ -49,6 +49,39 @@ jobs:
           echo "tag=$RAW_TAG" >> "$GITHUB_OUTPUT"
           echo "major=${RAW_TAG%%.*}" >> "$GITHUB_OUTPUT"
 
+      # action.yml pins one exact image version, and that reference has to name the release being cut. Getting it wrong is silent and nasty: the release publishes, but every consumer of the new tag runs the previous version's image — or fails to pull an image that does not exist.
+      - name: Check the image reference matches the release
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          python3 - <<'PY'
+          import os, re, sys, yaml
+
+          tag = os.environ["TAG"]
+          version = tag.lstrip("v")
+          image = (yaml.safe_load(open("action.yml"))["runs"] or {}).get("image", "")
+
+          if image == "Dockerfile":
+              # Only legitimate before the first image exists: the action builds on the runner.
+              print(f"::notice::action.yml still builds from the Dockerfile. That is expected for the first release; switch it to docker://…:{version} afterwards.")
+              sys.exit(0)
+
+          match = re.fullmatch(r"docker://.+:(?P<tag>[^:]+)", image)
+          if not match:
+              print(f"::error::action.yml `runs.image` is {image!r}, which is neither 'Dockerfile' nor a docker:// reference with an explicit tag")
+              sys.exit(1)
+
+          referenced = match.group("tag")
+          if referenced in {"latest"} or re.fullmatch(r"\d+(\.\d+)?", referenced):
+              print(f"::error::action.yml references the floating image tag ':{referenced}'. Pin the exact version ':{version}' so a pinned ref keeps running the code it was pinned to.")
+              sys.exit(1)
+          if referenced != version:
+              print(f"::error::action.yml references image ':{referenced}' but the release is {tag}. Update the reference to ':{version}' and re-tag.")
+              sys.exit(1)
+
+          print(f"action.yml correctly references :{version}")
+          PY
+
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -90,7 +123,8 @@ jobs:
             type=semver,pattern={{version}},value=${{ needs.verify.outputs.tag }}
             type=semver,pattern={{major}}.{{minor}},value=${{ needs.verify.outputs.tag }}
             type=semver,pattern={{major}},value=${{ needs.verify.outputs.tag }}
-            type=raw,value=latest
+            # A pre-release must not become `latest` — that tag is what someone lands on when they pull without thinking.
+            type=raw,value=latest,enable=${{ !contains(needs.verify.outputs.tag, '-') }}
 
       - name: Build and push
         uses: docker/build-push-action@v6

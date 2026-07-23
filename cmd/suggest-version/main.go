@@ -39,12 +39,32 @@ func run() error {
 		return err
 	}
 
-	client, err := afclient.New(cfg.APIURL, cfg.Token)
+	// The service account presents its client credentials and gets a short-lived token back. It is used for the calls below and never stored, logged, or emitted as an output.
+	token, err := afclient.Authenticate(ctx, cfg.APIURL, cfg.ClientID, cfg.ClientSecret)
+	if err != nil {
+		return err
+	}
+	// Mask it before it is used anywhere: the runner only masks values it was given as secrets, and a minted token is not one of them. Without this, a later step running with debug logging could print it in the clear.
+	//
+	// Only under a runner, though. Off a runner nothing interprets the workflow command, so it would print the token verbatim to a terminal or a captured log — the opposite of the intent.
+	if os.Getenv("GITHUB_ACTIONS") == "true" {
+		fmt.Printf("::add-mask::%s\n", token)
+	}
+	fmt.Printf("Authenticated service account %s\n", cfg.ClientID)
+
+	client, err := afclient.New(cfg.APIURL, token)
 	if err != nil {
 		return err
 	}
 
-	suggestions, err := client.SuggestedVersions(ctx, cfg.ArtefactID)
+	// The versions endpoint addresses an artefact by id, so the name is resolved first. The id is never asked for or emitted — a workflow only ever deals in names.
+	artefactID, err := client.ResolveArtefactID(ctx, cfg.ArtefactName)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Resolved artefact %s to %s\n", cfg.ArtefactName, artefactID)
+
+	suggestions, err := client.SuggestedVersions(ctx, artefactID)
 	if err != nil {
 		return err
 	}

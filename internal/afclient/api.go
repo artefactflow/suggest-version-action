@@ -30,7 +30,30 @@ type PreReleases struct {
 	RC    string `json:"rc"`
 }
 
-// SuggestedVersions fetches the suggested next versions for one artefact. artefactID is the artefact's 24-hex id — artefacts are addressed by id here, not by name.
+// artefactRef is the resolve endpoint's response: a minimal reference to one artefact.
+type artefactRef struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// ResolveArtefactID turns an artefact name into its 24-hex id. The match is exact and case-sensitive, and a name is unique within an organisation — which one that is comes from the token, so no further qualifier is needed.
+//
+// This is a separate call from the version lookup, and it needs its own scope: artefact:read here, version:read for the versions themselves.
+func (c *Client) ResolveArtefactID(ctx context.Context, name string) (string, error) {
+	q := url.Values{}
+	q.Set("name", name)
+
+	var ref artefactRef
+	if err := c.getJSON(ctx, "/v1/artefacts/resolve", q, &ref); err != nil {
+		return "", fmt.Errorf("resolve artefact %q: %w", name, err)
+	}
+	if ref.ID == "" {
+		return "", fmt.Errorf("resolve artefact %q: response contained no id", name)
+	}
+	return ref.ID, nil
+}
+
+// SuggestedVersions fetches the suggested next versions for one artefact, addressed by its 24-hex id.
 func (c *Client) SuggestedVersions(ctx context.Context, artefactID string) (*Suggestions, error) {
 	var s Suggestions
 	path := "/v1/artefacts/" + url.PathEscape(artefactID) + "/suggested-versions"

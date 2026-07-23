@@ -14,4 +14,8 @@ Fixes go onto the newest major release, and the moving major tag (for example `v
 
 ## Handling of credentials
 
-This action takes a bearer token as an input. It is used for exactly one thing — authenticating the API call — and it is never written to a log line, an error message, or an action output. Pass it from a secret rather than inlining it, so the runner masks it in the log if anything ever does print it.
+This action takes a service account's client id and client secret as inputs, and exchanges them for a short-lived access token. The secret is used for exactly one thing — that exchange — and it is never written to a log line, an error message, or an action output; the error path for the exchange is explicitly scrubbed of it, because that is the one request that carries a credential. The minted token is masked in the workflow log as soon as it is issued, is never emitted as an output, and is discarded when the action exits.
+
+The action deliberately does not accept an already-minted bearer token. That would make it easy to hand it a person's token, which carries far more scopes than the two this needs and attributes releases to a human rather than a machine identity.
+
+Pass the client secret from an encrypted secret rather than inlining it, so the runner masks it in the log if anything ever does print it.

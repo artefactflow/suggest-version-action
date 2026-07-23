@@ -4,6 +4,7 @@
 package afclient
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -73,11 +74,25 @@ func WithRetry(maxAttempts int, baseDelay, maxDelay time.Duration) Option {
 
 // New builds a Client for baseURL that authenticates every request with token. token must not be empty. It is never logged and is redacted from errors.
 func New(baseURL, token string, opts ...Option) (*Client, error) {
-	if baseURL == "" {
-		return nil, fmt.Errorf("afclient: base URL is required")
-	}
 	if token == "" {
 		return nil, fmt.Errorf("afclient: bearer token is required")
+	}
+	c, err := newClient(baseURL, opts...)
+	if err != nil {
+		return nil, err
+	}
+	base := c.http.Transport
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	c.http.Transport = &bearerTransport{token: token, base: base}
+	return c, nil
+}
+
+// newClient builds an unauthenticated client. Only the token endpoint uses one directly — every other call goes through New and carries a bearer token.
+func newClient(baseURL string, opts ...Option) (*Client, error) {
+	if baseURL == "" {
+		return nil, fmt.Errorf("afclient: base URL is required")
 	}
 	c := &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
@@ -87,11 +102,6 @@ func New(baseURL, token string, opts ...Option) (*Client, error) {
 	for _, o := range opts {
 		o(c)
 	}
-	base := c.http.Transport
-	if base == nil {
-		base = http.DefaultTransport
-	}
-	c.http.Transport = &bearerTransport{token: token, base: base}
 	return c, nil
 }
 
@@ -124,8 +134,15 @@ func (c *Client) getJSON(ctx context.Context, path string, query url.Values, dst
 	return nil
 }
 
-// getRaw performs a GET and returns the raw 200 body, mapping non-200 statuses to descriptive errors. Transient failures (connection errors, HTTP 429, and 5xx) are retried with exponential backoff and jitter, bounded by the client's retry policy; permanent failures (4xx other than 429) return immediately.
+// getRaw performs a GET and returns the raw 200 body.
 func (c *Client) getRaw(ctx context.Context, fullURL string) ([]byte, error) {
+	return c.doRaw(ctx, http.MethodGet, fullURL, nil)
+}
+
+// doRaw performs a request and returns the raw 200 body, mapping non-200 statuses to descriptive errors. Transient failures (connection errors, HTTP 429, and 5xx) are retried with exponential backoff and jitter, bounded by the client's retry policy; permanent failures (4xx other than 429) return immediately.
+//
+// reqBody is held as bytes rather than a reader so each attempt can build a fresh request. Only two calls use this: an idempotent GET, and the POST that mints a token — replaying that one mints another token and has no other effect, so it is equally safe to retry.
+func (c *Client) doRaw(ctx context.Context, method, fullURL string, reqBody []byte) ([]byte, error) {
 	var (
 		lastErr        error
 		lastRetryAfter time.Duration
@@ -136,7 +153,7 @@ func (c *Client) getRaw(ctx context.Context, fullURL string) ([]byte, error) {
 				return nil, err
 			}
 		}
-		body, retryable, retryAfter, err := c.getOnce(ctx, fullURL)
+		body, retryable, retryAfter, err := c.doOnce(ctx, method, fullURL, reqBody)
 		if err == nil {
 			return body, nil
 		}
@@ -148,13 +165,20 @@ func (c *Client) getRaw(ctx context.Context, fullURL string) ([]byte, error) {
 	return nil, lastErr
 }
 
-// getOnce performs a single GET attempt. It reports whether the failure is worth retrying and any server-requested Retry-After delay.
-func (c *Client) getOnce(ctx context.Context, fullURL string) (body []byte, retryable bool, retryAfter time.Duration, err error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
+// doOnce performs a single attempt. It reports whether the failure is worth retrying and any server-requested Retry-After delay.
+func (c *Client) doOnce(ctx context.Context, method, fullURL string, reqBody []byte) (body []byte, retryable bool, retryAfter time.Duration, err error) {
+	var payload io.Reader
+	if reqBody != nil {
+		payload = bytes.NewReader(reqBody)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, fullURL, payload)
 	if err != nil {
 		return nil, false, 0, err
 	}
 	req.Header.Set("Accept", "application/json")
+	if reqBody != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		// A cancelled or timed-out context is deliberate — never retry it.
@@ -170,7 +194,7 @@ func (c *Client) getOnce(ctx context.Context, fullURL string) (body []byte, retr
 	if resp.StatusCode == http.StatusOK {
 		return body, false, 0, nil
 	}
-	statusErr := &StatusError{Status: resp.StatusCode, Snippet: snippet(body)}
+	statusErr := newStatusError(resp.StatusCode, body)
 	if isRetryableStatus(resp.StatusCode) {
 		return nil, true, parseRetryAfter(resp.Header.Get("Retry-After")), statusErr
 	}
@@ -208,21 +232,79 @@ func waitBackoff(ctx context.Context, d time.Duration) error {
 
 // StatusError is a non-200 response from the ArtefactFlow API.
 type StatusError struct {
-	Status  int
+	Status int
+	// Code, Message, and LogID are the API's own error envelope, when the body carried one. LogID is what support needs to find the request in the API's logs, so it is always surfaced.
+	Code    string
+	Message string
+	LogID   string
+	// Snippet is a bounded excerpt of the raw body, used when the response was not the documented error envelope — an HTML error page from a proxy, say.
 	Snippet string
+}
+
+// Error codes the action can say something more useful about than the API's own wording. Anything else falls through to the generic message plus whatever the API said.
+const (
+	codeInvalidCredentials     = "AUTH00001"
+	codeServiceAccountUnusable = "SERVICEACCOUNT01455"
+	codeServiceAccountExpired  = "SERVICEACCOUNT01456"
+)
+
+// apiError is the API's error envelope. The log id field is `logid` on the wire.
+type apiError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+	LogID   string `json:"logid"`
+}
+
+// newStatusError builds a StatusError, preferring the API's structured error body over a raw excerpt. A body that is not the documented envelope — a proxy's HTML error page, for instance — falls back to the excerpt.
+func newStatusError(status int, body []byte) *StatusError {
+	e := &StatusError{Status: status}
+	var parsed apiError
+	if err := json.Unmarshal(body, &parsed); err == nil && parsed.Code != "" {
+		e.Code, e.Message, e.LogID = parsed.Code, parsed.Message, parsed.LogID
+		return e
+	}
+	e.Snippet = snippet(body)
+	return e
+}
+
+// detail renders whatever the API said about the failure, in one line.
+func (e *StatusError) detail() string {
+	parts := make([]string, 0, 3)
+	if e.Message != "" {
+		parts = append(parts, e.Message)
+	}
+	if e.Code != "" {
+		parts = append(parts, "code "+e.Code)
+	}
+	if e.LogID != "" {
+		parts = append(parts, "log id "+e.LogID)
+	}
+	if len(parts) == 0 {
+		return e.Snippet
+	}
+	return strings.Join(parts, ", ")
 }
 
 func (e *StatusError) Error() string {
 	switch e.Status {
 	case http.StatusUnauthorized:
-		return fmt.Sprintf("HTTP 401: the token was rejected. Check that it is valid and not expired: %s", e.Snippet)
+		// The token endpoint returns 401 for several distinct causes, and the codes are the only way to tell them apart — "invalid credentials" is deliberately returned for both an unknown client id and a wrong secret, so that one cannot be narrowed further.
+		switch e.Code {
+		case codeInvalidCredentials:
+			return fmt.Sprintf("HTTP 401: the client credentials were rejected. Check `client-id` and `client-secret`; a rotated secret invalidates the previous one immediately (%s)", e.detail())
+		case codeServiceAccountUnusable:
+			return fmt.Sprintf("HTTP 401: the service account cannot mint tokens — it is deactivated, or its organisation is inactive (%s)", e.detail())
+		case codeServiceAccountExpired:
+			return fmt.Sprintf("HTTP 401: the service account has passed its expiry date and can no longer mint tokens. Extend it before it lapses (%s)", e.detail())
+		}
+		return fmt.Sprintf("HTTP 401: the token was rejected. Check that it is valid and not expired (%s)", e.detail())
 	case http.StatusForbidden:
-		// Both authorization axes fail with 403, and the scope is the one people check first — name the team layer explicitly so a correctly-scoped service account is not mistaken for a scope problem.
-		return fmt.Sprintf("HTTP 403: the token needs the artefact:read scope, and its principal must belong to a team with read access to the artefact's group: %s", e.Snippet)
+		// Both authorization axes fail with 403, and the scope is the one people check first — name the team layer explicitly so a correctly-scoped service account is not mistaken for a scope problem. The two calls need different scopes, so both are named.
+		return fmt.Sprintf("HTTP 403: the token needs the artefact:read scope to look an artefact up by name and version:read to read its versions, and its principal must belong to a team with read access to the artefact's group (%s)", e.detail())
 	case http.StatusNotFound:
-		return fmt.Sprintf("HTTP 404: no such artefact. artefact-id must be the artefact's 24-hex id, not its name: %s", e.Snippet)
+		return fmt.Sprintf("HTTP 404: no such artefact on this instance (%s)", e.detail())
 	default:
-		return fmt.Sprintf("artefactflow api returned HTTP %d: %s", e.Status, e.Snippet)
+		return fmt.Sprintf("artefactflow api returned HTTP %d (%s)", e.Status, e.detail())
 	}
 }
 

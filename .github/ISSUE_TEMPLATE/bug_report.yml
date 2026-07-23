@@ -24,9 +24,9 @@ body:
       placeholder: |
         - uses: artefactflow/suggest-version-action@v1
           with:
-            api-url: https://api.example
-            token: ${{ secrets.ARTEFACTFLOW_TOKEN }}
-            artefact-id: 0123456789abcdef01234567
+            client-id: ${{ secrets.ARTEFACTFLOW_CLIENT_ID }}
+            client-secret: ${{ secrets.ARTEFACTFLOW_CLIENT_SECRET }}
+            artefact-name: acme-payment-service
     validations:
       required: true
 

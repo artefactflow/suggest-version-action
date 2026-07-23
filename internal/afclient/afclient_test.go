@@ -78,6 +78,80 @@ func TestNewRequiresBaseURLAndToken(t *testing.T) {
 	}
 }
 
+func TestResolveArtefactID(t *testing.T) {
+	var gotPath, gotQuery, gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotQuery, gotAuth = r.URL.Path, r.URL.Query().Get("name"), r.Header.Get("Authorization")
+		w.Write([]byte(`{"id":"` + artefactID + `","name":"acme-payment-service"}`))
+	}))
+	defer srv.Close()
+
+	id, err := newTestClient(t, srv).ResolveArtefactID(context.Background(), "acme-payment-service")
+	if err != nil {
+		t.Fatalf("ResolveArtefactID: %v", err)
+	}
+	if gotPath != "/v1/artefacts/resolve" {
+		t.Errorf("path = %q", gotPath)
+	}
+	if gotQuery != "acme-payment-service" {
+		t.Errorf("name query = %q", gotQuery)
+	}
+	if gotAuth != "Bearer secret-token" {
+		t.Errorf("Authorization = %q", gotAuth)
+	}
+	if id != artefactID {
+		t.Errorf("id = %q, want %q", id, artefactID)
+	}
+}
+
+// A name is matched exactly and case-sensitively, and may contain characters that need escaping in a query string.
+func TestResolveArtefactIDEscapesName(t *testing.T) {
+	var gotName string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotName = r.URL.Query().Get("name")
+		w.Write([]byte(`{"id":"` + artefactID + `","name":"x"}`))
+	}))
+	defer srv.Close()
+
+	if _, err := newTestClient(t, srv).ResolveArtefactID(context.Background(), "Acme_Payment-Service"); err != nil {
+		t.Fatalf("ResolveArtefactID: %v", err)
+	}
+	if gotName != "Acme_Payment-Service" {
+		t.Errorf("name = %q, want the exact name preserved", gotName)
+	}
+}
+
+func TestResolveArtefactIDNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`{"code":"ARTEFACT00509","message":"Artefact not found","logid":"abc123"}`))
+	}))
+	defer srv.Close()
+
+	_, err := newTestClient(t, srv).ResolveArtefactID(context.Background(), "nope")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	// The name is what the user typed, so it belongs in the message; the log id is what support needs.
+	for _, want := range []string{"nope", "Artefact not found", "abc123"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
+// A 200 with no id is not a usable answer.
+func TestResolveArtefactIDEmptyResponse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"name":"acme"}`))
+	}))
+	defer srv.Close()
+
+	if _, err := newTestClient(t, srv).ResolveArtefactID(context.Background(), "acme"); err == nil {
+		t.Fatal("expected an error when the response carries no id")
+	}
+}
+
 func TestStatusErrors(t *testing.T) {
 	tests := []struct {
 		status  int
@@ -85,14 +159,15 @@ func TestStatusErrors(t *testing.T) {
 	}{
 		{http.StatusUnauthorized, "token was rejected"},
 		{http.StatusForbidden, "artefact:read"},
+		{http.StatusForbidden, "version:read"},
 		{http.StatusForbidden, "team"},
-		{http.StatusNotFound, "24-hex id"},
+		{http.StatusNotFound, "no such artefact"},
 		{http.StatusBadRequest, "HTTP 400"},
 	}
 	for _, tc := range tests {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(tc.status)
-			w.Write([]byte(`{"error":"denied"}`))
+			w.Write([]byte(`{"code":"GEN00003","message":"Not allowed to do or access this","logid":"deadbeef"}`))
 		}))
 		_, err := newTestClient(t, srv).SuggestedVersions(context.Background(), artefactID)
 		srv.Close()
@@ -106,6 +181,46 @@ func TestStatusErrors(t *testing.T) {
 		if strings.Contains(err.Error(), "secret-token") {
 			t.Errorf("status %d: error leaked the token: %v", tc.status, err)
 		}
+	}
+}
+
+// The API's own error envelope carries the detail worth showing; the log id in particular is what support asks for.
+func TestStatusErrorUsesAPIErrorEnvelope(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"code":"GEN00003","message":"Not allowed to do or access this","logid":"deadbeef"}`))
+	}))
+	defer srv.Close()
+
+	_, err := newTestClient(t, srv).SuggestedVersions(context.Background(), artefactID)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	for _, want := range []string{"Not allowed to do or access this", "GEN00003", "deadbeef"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
+// A response that is not the documented envelope — a proxy's HTML error page, say — still has to produce something diagnosable.
+func TestStatusErrorFallsBackToBodySnippet(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		w.Write([]byte(`<html><body>502 Bad Gateway</body></html>`))
+	}))
+	defer srv.Close()
+
+	c, err := New(srv.URL, "secret-token", WithHTTPClient(srv.Client()), WithRetry(1, 0, 0))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = c.SuggestedVersions(context.Background(), artefactID)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "502 Bad Gateway") {
+		t.Errorf("error %q does not include the body snippet", err)
 	}
 }
 
