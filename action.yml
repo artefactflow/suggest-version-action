@@ -1,0 +1,62 @@
+# Marketplace requires action.yml at the repository root, which is why this action lives in its own repository.
+name: 'ArtefactFlow Suggest Version'
+description: 'Fetch the suggested next version for an ArtefactFlow artefact and expose it as an output for tagging, changelogs, and releases.'
+author: 'ArtefactFlow'
+
+branding:
+  icon: 'tag'
+  color: 'blue'
+
+# Every input can also be supplied as an ARTEFACTFLOW_-prefixed environment variable, so one job-level `env:` block can configure every step. A `with:` value always wins over the variable.
+#
+# `api-url` and `bump` deliberately declare no `default:`. The runner substitutes a declared default before the action runs, which would make the input non-empty and the environment variable unreachable; their defaults are applied by the action itself.
+inputs:
+  api-url:
+    description: 'Base URL of the ArtefactFlow API. Defaults to https://api.artefactflow.app; override it only if you have been given a different endpoint. Environment variable: ARTEFACTFLOW_API_URL.'
+    required: false
+  client-id:
+    description: "A service account's client id: its id, a UUID. Environment variable: ARTEFACTFLOW_CLIENT_ID."
+    required: true
+  client-secret:
+    description: "The service account's client secret. Pass it from a secret. Never inline it in the workflow file. Environment variable: ARTEFACTFLOW_CLIENT_SECRET."
+    required: true
+  artefact-name:
+    description: 'The artefact name. Exact and case-sensitive, and unique within your organisation. Environment variable: ARTEFACTFLOW_ARTEFACT_NAME.'
+    required: true
+  bump:
+    description: 'Which suggestion becomes the `version` output: suggested (default), major, minor, patch, alpha, beta, or rc. All variants are always available as their own outputs. Environment variable: ARTEFACTFLOW_BUMP.'
+    required: false
+  line:
+    description: "The release line to suggest from, as its major.minor prefix (e.g. 1.4). Set this on a maintenance branch: without it the API answers from the artefact's newest line, so a job building 1.4.x would be handed the next 1.6.x version. Unset means the newest line, which is what a main-branch workflow wants. Environment variable: ARTEFACTFLOW_LINE."
+    required: false
+
+outputs:
+  version:
+    description: 'The selected suggestion, per the `bump` input. Defaults to the version the API suggests.'
+  latest:
+    description: "The artefact's highest existing version by SemVer precedence, which is not necessarily the most recently created one. `0.0.0` when the artefact has no versions at all; empty when a `line` was requested that has no versions yet."
+  major:
+    description: 'The next version with the major level incremented.'
+  minor:
+    description: 'The next version with the minor level incremented.'
+  patch:
+    description: 'The next version with the patch level incremented.'
+  alpha:
+    description: 'The alpha pre-release variant of the suggested version.'
+  beta:
+    description: 'The beta pre-release variant of the suggested version.'
+  rc:
+    description: 'The release-candidate pre-release variant of the suggested version.'
+  line:
+    description: "The release line the suggestions belong to, as its major.minor prefix. Read from the response rather than echoed from the input, so an unscoped run still reports which line it was answered from. Empty when the artefact has no versions yet."
+  lines:
+    description: "Every release line currently in flight for the artefact, newest first, comma-separated (e.g. `1.6,1.5,1.4`). Lets a workflow detect that an artefact is under parallel maintenance without parsing JSON. Capped at five; lines whose newest version is end-of-life are omitted."
+
+runs:
+  using: 'docker'
+  # Built from source on the runner until the first release publishes an image. From then on this references one exact, immutable image version, which is bumped as part of cutting a release:
+  #
+  #   image: 'docker://ghcr.io/artefactflow/suggest-version-action:1.2.3'
+  #
+  # Exact, not a floating `:1`. A consumer who pins `uses: ...@v1.2.0` or a commit SHA expects to keep running that code; a floating tag would silently hand them a newer image and make pinning meaningless. The release workflow refuses to publish if this reference and the release tag disagree.
+  image: 'Dockerfile'
