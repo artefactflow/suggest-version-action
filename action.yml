@@ -1,6 +1,6 @@
 # Marketplace requires action.yml at the repository root, which is why this action lives in its own repository.
 name: 'ArtefactFlow Suggest Version'
-description: 'Fetch the suggested next version for an ArtefactFlow artefact and expose it as an output for tagging, changelogs, and releases.'
+description: 'Fetch the suggested next version for an ArtefactFlow artefact, as outputs for tagging, changelogs and releases.'
 author: 'ArtefactFlow'
 
 branding:
@@ -57,4 +57,4 @@ runs:
   # One exact, immutable image version, published by the release workflow and bumped as part of cutting each release.
   #
   # Exact, not a floating `:1`. A consumer who pins `uses: ...@v1.2.0` or a commit SHA expects to keep running that code; a floating tag would silently hand them a newer image and make pinning meaningless. The release workflow refuses to publish if this reference and the release tag disagree.
-  image: 'docker://ghcr.io/artefactflow/suggest-version-action:1.0.0'
+  image: 'docker://ghcr.io/artefactflow/suggest-version-action:1.0.1'
